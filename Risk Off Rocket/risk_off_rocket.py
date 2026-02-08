@@ -23,10 +23,10 @@ class RiskOffRocket(QCAlgorithm):
         # -----------------------------
         # Regime params (UNCHANGED)
         # -----------------------------
-        self.hold_bars = 1
+        self.hold_bars = 0
         self.lb_short = 3
-        self.lb_mid   = 10
-        self.lb_long  = 105
+        self.lb_mid   = 12
+        self.lb_long  = 84
 
         self.risk_off_hold_counter = 0
         self.is_risk_off = False
@@ -67,19 +67,19 @@ class RiskOffRocket(QCAlgorithm):
         # -----------------------------
         self.Schedule.On(
             self.DateRules.EveryDay(self.sym_spxl),
-            self.TimeRules.AfterMarketOpen(self.sym_spxl, 5),
+            self.TimeRules.BeforeMarketClose(self.sym_spxl, 5),
             self.Rebalance
         )
 
     # ==================================================
     # History helpers
     # ==================================================
-    def _history_closes(self, symbols, bars):
+    def _history_closes(self, symbols, bars, norm_mode):
         hist = self.History(
             symbols,
             bars,
             Resolution.Daily,
-            dataNormalizationMode=DataNormalizationMode.TOTAL_RETURN
+            dataNormalizationMode=norm_mode
         )
         if hist.empty:
             return None
@@ -90,15 +90,16 @@ class RiskOffRocket(QCAlgorithm):
     # ==================================================
     def _avg_cum_mom_last(self, symbol):
         bars = self.lb_long + 1
-        closes = self._history_closes([symbol], bars)
+        closes = self._history_closes([symbol], bars, norm_mode=DataNormalizationMode.SCALED_RAW)
+        # closes = self._history_closes([symbol], bars)
         if closes is None or symbol not in closes:
             return np.nan
 
         px = closes[symbol]
         try:
-            r10 = px.iloc[-1] / px.iloc[-1 - self.lb_short] - 1
-            r21 = px.iloc[-1] / px.iloc[-1 - self.lb_mid]   - 1
-            r63 = px.iloc[-1] / px.iloc[-1 - self.lb_long]  - 1
+            r10 = px.iloc[-1] / px.iloc[-(self.lb_short + 1)] - 1
+            r21 = px.iloc[-1] / px.iloc[-(self.lb_mid + 1)]   - 1
+            r63 = px.iloc[-1] / px.iloc[-(self.lb_long + 1)]  - 1
             return (r10 + r21 + r63) / 3.0
         except:
             return np.nan
@@ -183,7 +184,8 @@ class RiskOffRocket(QCAlgorithm):
 
         closes = self._history_closes(
             list(risk_groups.values()),
-            self.vol_lookback + 253
+            self.vol_lookback + 253,
+            norm_mode=DataNormalizationMode.TOTAL_RETURN
         )
         if closes is None:
             return
@@ -198,25 +200,28 @@ class RiskOffRocket(QCAlgorithm):
             if len(g_rets) < self.winrate_lookback:
                 continue
 
-            p_win = float(np.mean(g_rets.tail(self.winrate_lookback) > 0))
+            log_group = np.log1p(g_rets)
+            p_win = float(np.mean(log_group.tail(self.winrate_lookback) > 0))
 
             group_mom = self._compute_group_momentum(sym, closes)
-            mom_std = float(np.std(g_rets.tail(self.vol_lookback)))
 
-            confidence = abs(group_mom) / (mom_std + 1e-6)
-            confidence = np.clip(confidence, 0.0, 2.0)
-
-            scale = max(0.1, 1.0 + confidence * np.sign(group_mom))
-            edge = p_win * scale
-
-            g_vol = float(
-                np.std(np.log1p(g_rets.tail(self.vol_lookback))) * np.sqrt(252)
-            )
-            if g_vol <= 0:
+            if not np.isfinite(group_mom) or group_mom <= 0:
                 continue
 
-            edges[g] = edge
+            g_vol = float(
+                np.std(log_group.tail(self.vol_lookback)) * np.sqrt(252)
+            )
+
+            if not np.isfinite(g_vol) or g_vol <= 0:
+                continue
+
             vols[g] = g_vol
+
+            # Pattern Match: Confidence calculation
+            confidence = group_mom / (g_vol + 1e-6)
+            edge = p_win * (1.0 + confidence)
+
+            edges[g] = edge
 
         if not edges:
             self.SetHoldings(self.sym_shv, 1.0)
